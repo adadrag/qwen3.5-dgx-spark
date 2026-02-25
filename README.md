@@ -12,6 +12,7 @@ A complete guide to running [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.
 - [API Usage](#api-usage)
 - [Benchmark Results](#benchmark-results)
 - [Vision / Multimodal Features](#vision--multimodal-features)
+- [Multi-User Concurrency Benchmarks](#multi-user-concurrency-benchmarks)
 - [Stress Testing / Context Limits](#stress-testing--context-limits)
 - [Comparison with Other Models](#comparison-with-other-models)
 - [Troubleshooting](#troubleshooting)
@@ -293,6 +294,47 @@ All classic reasoning benchmarks passed correctly:
 | HLE w/ CoT | 22.4 | 24.3 | 14.9 | 18.2 | 19.4 |
 
 **Key takeaway**: With only 3B active parameters, this model beats GPT-OSS-120B and Qwen3-235B on most knowledge and reasoning benchmarks.
+
+## Multi-User Concurrency Benchmarks
+
+Tested with realistic RAG-style requests (system prompt + retrieved document chunks + question, 200-token responses, thinking mode disabled) to simulate a company assistant workload.
+
+### Results
+
+| Concurrent Users | Per-User Speed | Avg Latency (200 tokens) | Aggregate Throughput | Errors |
+|-----------------|---------------|--------------------------|---------------------|--------|
+| 1 | 3.3 tok/s | 60.7s | 3.3 tok/s | 0 |
+| 5 | 13.0 tok/s | 15.4s | 64.9 tok/s | 0 |
+| 10 | 8.2 tok/s | 24.4s | 82.0 tok/s | 0 |
+| 20 | 9.4 tok/s | 21.4s | 186.4 tok/s | 0 |
+| 50 | 6.2 tok/s | 32.5s | 307.7 tok/s | 0 |
+| 100 | 4.3 tok/s | 47.2s | **423.5 tok/s** | 0 |
+
+### Analysis
+
+- **Aggregate throughput scales from 3.3 to 423.5 tok/s** (128x improvement) as concurrency increases
+- **100 concurrent users**: all requests completed successfully, 4.3 tok/s per user, ~47s latency for a 200-token answer
+- **Zero errors** at all concurrency levels — vLLM's continuous batching handles load gracefully
+- **Sweet spot at 5-20 users**: best balance of per-user speed (9-13 tok/s) and aggregate throughput
+
+### Why It Scales So Well
+
+The MoE architecture is uniquely suited for concurrent serving:
+
+1. **Only 3B active parameters** — GPU compute per token is minimal, leaving headroom for batching
+2. **vLLM continuous batching** — new requests join the active batch without waiting for others to finish
+3. **128 GB unified memory** — large KV cache pool shared efficiently across concurrent requests
+4. **Short RAG contexts** (4-16K tokens per user) — KV cache per user is small, allowing many concurrent sessions
+
+### Enterprise Use Case Viability
+
+| Scenario | Users | Expected Latency | Verdict |
+|----------|-------|-------------------|---------|
+| Small team RAG assistant | 5-10 | 15-25s | Excellent |
+| Department-wide assistant | 20-50 | 21-33s | Good |
+| Company-wide (peak load) | 100 | ~47s | Viable |
+
+> **Note**: Latencies above are for 200-token responses. Shorter responses (e.g., 50-100 tokens for quick Q&A) will be proportionally faster. With streaming enabled, users see the first tokens almost immediately regardless of concurrency.
 
 ## Stress Testing / Context Limits
 
