@@ -12,6 +12,7 @@ A complete guide to running [Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.
 - [API Usage](#api-usage)
 - [Benchmark Results](#benchmark-results)
 - [Vision / Multimodal Features](#vision--multimodal-features)
+- [Stress Testing / Context Limits](#stress-testing--context-limits)
 - [Comparison with Other Models](#comparison-with-other-models)
 - [Troubleshooting](#troubleshooting)
 - [License](#license)
@@ -292,6 +293,68 @@ All classic reasoning benchmarks passed correctly:
 | HLE w/ CoT | 22.4 | 24.3 | 14.9 | 18.2 | 19.4 |
 
 **Key takeaway**: With only 3B active parameters, this model beats GPT-OSS-120B and Qwen3-235B on most knowledge and reasoning benchmarks.
+
+## Stress Testing / Context Limits
+
+We ran extensive stress tests to find the breaking point of vLLM + Qwen3.5-35B-A3B on DGX Spark. Spoiler: **vLLM is extremely resilient** — it never OOM'd or crashed.
+
+### Single Request Context Tests
+
+| Test | Prompt Tokens | Max Tokens | Result | Time |
+|------|--------------|------------|--------|------|
+| 50K moderate | 62,501 | 10 | OK | 18.8s |
+| 130K half capacity | 162,501 | 10 | OK | 48.3s |
+| 250K near max | ~262K | 10 | Rejected (over limit by 1 token) | instant |
+| 500K double limit | ~500K text sent | 100 | Rejected (tokenizer capped at 262K) | instant |
+| 1M quadruple limit | ~1M text sent | 100 | Rejected (tokenizer capped at 262K) | instant |
+
+**Key finding**: vLLM **truncates tokenization** at `max_model_len`. Even sending 1 million tokens of text, the tokenizer stops at 262,144 and returns a clean error. No OOM possible through the API.
+
+### Concurrent Request Tests (262K context config)
+
+| Test | Requests | Tokens Each | Total Demand | Result |
+|------|----------|-------------|-------------|--------|
+| 4x prefill only | 4 | 250K prompt + 10 output | 1M tokens | All OK (serialized, 72s each) |
+| 4x with generation | 4 | 192K prompt + 2000 output | ~776K tokens | 1 completed (595s), 3 timed out waiting |
+
+**Key finding**: vLLM's scheduler **serializes** requests when KV cache is full. It processes one, frees KV, then processes the next. Requests queue rather than crash.
+
+### Forced 1M Context Window (Override)
+
+We restarted vLLM with `--max-model-len 1048576` and `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` to force 1M context (4x the model's trained 262K):
+
+```bash
+docker run -d \
+  -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  --gpus all --ipc=host \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -p 8000:8000 \
+  vllm/vllm-openai:cu130-nightly \
+  Qwen/Qwen3.5-35B-A3B \
+  --max-model-len 1048576 \
+  --gpu-memory-utilization 0.95
+```
+
+**Startup results:**
+- Model weights: 65.53 GiB
+- Available KV cache: 44.47 GiB
+- KV cache capacity: **581,856 tokens**
+- Max concurrency for 1M requests: **2.21x**
+
+| Test | Tokens | Result | Time |
+|------|--------|--------|------|
+| 300K prompt (over 262K native) | 300,001 | OK | 179.7s |
+| 3x concurrent 300K | ~450K each | All completed (serialized) | ~380s |
+
+**Key finding**: The model processes 300K+ tokens beyond its trained 262K context via RoPE extrapolation. vLLM allocated 581K tokens of KV cache from the available 44.47 GiB. No OOM — the scheduler queues requests that don't fit.
+
+### Conclusions
+
+1. **You cannot OOM vLLM through the API** — it validates input length before allocating KV cache
+2. **Concurrent large requests queue**, they don't crash — vLLM serializes when KV cache is full
+3. **The 262K context limit is soft** — with `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1`, the model processes 300K+ tokens (quality may degrade beyond trained range)
+4. **At 0.95 GPU memory utilization**, the system handles 1M context config with 581K token KV cache capacity
+5. **vLLM's scheduler is the real safety net** — it never allocates more than available, just queues
 
 ## Vision / Multimodal Features
 
