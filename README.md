@@ -79,6 +79,8 @@ This image contains:
 - PyTorch with Blackwell support
 - FlashAttention backend
 
+**Note on community DGX Spark images**: The [`avarok/vllm-dgx-spark`](https://hub.docker.com/r/avarok/vllm-dgx-spark) image is purpose-built for GB10 with SM12.1 kernel optimizations, but ships with vLLM 0.14.0 which **does not support Qwen3.5**. As of March 2026, the nightly build above is required for Qwen3.5.
+
 ### Step 3: Launch the Model
 
 ```bash
@@ -104,6 +106,8 @@ docker run -d \
 ```
 
 > **Note**: The `vllm/vllm-openai:cu130-nightly` image has `vllm serve` as its entrypoint, so the model name is passed directly as the first argument (not `vllm serve Qwen/...`).
+
+> **CUDA graphs**: On first startup, watch the logs (`docker logs qwen35 -f`) and confirm CUDA graph capture completes (look for `Capturing CUDA graphs ... 100%`). The first inference request after a fresh container start will be slow (~57s) due to torch.compile warmup, but subsequent requests run at full speed.
 
 First run will download ~70 GB of model weights. Subsequent starts use the cached weights.
 
@@ -155,6 +159,40 @@ VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 vllm serve Qwen/Qwen3.5-35B-A3B \
     "original_max_position_embeddings": 262144
   }}}'
 ```
+
+### NVFP4 Quantization (Experimental)
+
+NVIDIA's firmware updates unlocked NVFP4 (4-bit floating point) on the DGX Spark, offering up to 2.5x throughput gains. With NVFP4, model weights shrink from ~70 GB to ~18 GB, leaving ~80+ GB for KV cache:
+
+```bash
+docker run -d \
+  --name qwen35-nvfp4 \
+  --restart unless-stopped \
+  --gpus all \
+  --ipc host \
+  --shm-size 64gb \
+  -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  vllm/vllm-openai:cu130-nightly \
+  Qwen/Qwen3.5-35B-A3B \
+    --served-model-name qwen3.5-35b \
+    --port 8000 \
+    --host 0.0.0.0 \
+    --max-model-len 262144 \
+    --gpu-memory-utilization 0.80 \
+    --quantization nvfp4 \
+    --reasoning-parser qwen3 \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_coder \
+    --enable-prefix-caching
+```
+
+| Mode | Weights | KV Cache (0.80 util) | Expected Speed |
+|------|---------|---------------------|----------------|
+| BF16 (default) | ~70 GB | ~28.6 GB | ~31 tok/s |
+| NVFP4 | ~18 GB | ~80+ GB | ~60+ tok/s (estimated) |
+
+> **Note**: NVFP4 quantization may affect output quality slightly. Benchmark your specific use case before switching. Requires DGX OS firmware that supports NVFP4.
 
 ### Text-Only Mode (Disable Vision Encoder)
 
@@ -368,6 +406,7 @@ We restarted vLLM with `--max-model-len 1048576` and `VLLM_ALLOW_LONG_MAX_MODEL_
 ```bash
 docker run -d \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+  -e VLLM_FLASHINFER_MOE_BACKEND=latency \
   --gpus all --ipc=host \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -p 8000:8000 \
@@ -443,6 +482,14 @@ Same issue as above. The NVIDIA `nvcr.io/nvidia/vllm:26.01-py3` container ships 
 
 Reduce `--gpu-memory-utilization` from `0.90` to `0.80`. Community reports confirm `0.80` is stable for long-running sessions.
 
+### First request is very slow (~57s)
+
+This is normal after a fresh container start. vLLM uses `torch.compile` with inductor backend, and the first inference triggers compilation and caching. Subsequent requests run at full speed (~31 tok/s). The compiled cache persists within the container lifetime.
+
+### CUDA graphs not captured
+
+If startup logs don't show `Capturing CUDA graphs ... 100%`, performance will be degraded (eager mode fallback). Check `docker logs qwen35` for CUDA graph messages. If graphs fail, try adding `--enforce-eager` temporarily to confirm the issue, then investigate the underlying CUDA compatibility.
+
 ### "MoE config file not found" warning
 
 ```
@@ -450,7 +497,7 @@ WARNING: Using default MoE config. Performance might be sub-optimal!
 Config file not found at .../E=256,N=512,device_name=NVIDIA_GB10.json
 ```
 
-This is expected -- there is no optimized MoE kernel config for the GB10 GPU yet. The model still runs correctly with default settings.
+This is expected -- there is no optimized MoE kernel config for the GB10 GPU yet. The model still runs correctly with default settings. We tested custom MoE configs adapted from the `avarok/vllm-dgx-spark` image (tuned for GB10 with fp8) but found that the GB10's shared memory limit (101,376 bytes) is too small for the larger block sizes, and conservative configs actually performed **worse** (~30.5 tok/s) than vLLM's auto-tuned defaults (~32 tok/s).
 
 ### PyTorch CUDA capability warning
 
@@ -491,6 +538,21 @@ docker rm -f qwen35
 # Check GPU memory usage
 nvidia-smi
 ```
+
+## SM12.1 Optimization Attempts (Tested)
+
+Community forums suggest several optimizations for the GB10's SM12.1 (Blackwell) compute capability. We tested the following on March 11, 2026:
+
+| Optimization | Result | Details |
+|---|---|---|
+| `VLLM_FLASHINFER_MOE_BACKEND=latency` | **No effect** | vLLM v0.16.0 uses Triton (not FlashInfer) for unquantized MoE. The env var is ignored. |
+| `avarok/vllm-dgx-spark` image | **Incompatible** | Ships vLLM 0.14.0 — no `Qwen3_5MoeForConditionalGeneration` support. |
+| Custom GB10 MoE config (from avarok) | **Crashed** | `BLOCK_SIZE_K=128, num_stages=5` exceeds GB10 shared memory (101,376 bytes; needs 163,840). |
+| Conservative MoE config (`BLOCK_SIZE_K=64, num_stages=2`) | **Slower** | ~30.5 tok/s vs baseline ~32 tok/s. vLLM's auto-tuned defaults are better. |
+
+**Conclusion**: The nightly `vllm/vllm-openai:cu130-nightly` image with default settings is already near-optimal for BF16 inference on GB10. The ~31-32 tok/s appears to be the hardware ceiling for this precision. The `TORCH_CUDA_ARCH_LIST` in the nightly already includes `12.1`, confirming SM12.1 kernels are compiled.
+
+**Remaining untested**: NVFP4 quantization (`--quantization nvfp4`) could potentially double throughput by reducing model weights from ~70 GB to ~18 GB, but requires firmware support and vLLM NVFP4 backend compatibility verification.
 
 ## References
 
